@@ -618,10 +618,30 @@ class NemotronDiffusionSampler(DiffusionSampler):
         canvas = states.canvas[decode_slots].clone()  # [num_decode, CL]
         is_masked = canvas == mask_id
 
-        # Confidence is only valid for masked positions; -inf elsewhere
-        # so they never win the top-k.
+        # EOS-freeze (FastDiffuser): if EOS has already been committed in
+        # the block, every position at-or-after the first EOS is "frozen"
+        # — they get -inf confidence so the top-k never picks them, and
+        # they're filled with EOS at the end of this step. Without this
+        # the model keeps generating after an EOS landed mid-block,
+        # producing the long meandering outputs that drag down accuracy.
+        committed = ~is_masked
+        eos_freeze = torch.zeros_like(canvas, dtype=torch.bool)
+        if self.eos_token_id is not None:
+            eos = self.eos_token_id
+            eos_committed = committed & (canvas == eos)
+            if eos_committed.any():
+                first_eos_pos = torch.where(
+                    eos_committed.any(dim=-1),
+                    torch.argmax(eos_committed.int(), dim=-1),
+                    torch.full_like(eos_committed.int()[:, 0], CL),
+                )
+                positions = torch.arange(CL, device=device).unsqueeze(0)
+                eos_freeze = positions >= first_eos_pos.unsqueeze(-1)
+
+        # Confidence is only valid for masked AND non-frozen positions.
+        active = is_masked & ~eos_freeze
         confidence = torch.where(
-            is_masked, x0_p, torch.full_like(x0_p, float("-inf"))
+            active, x0_p, torch.full_like(x0_p, float("-inf"))
         )
 
         # FastDiffuser scheduler: unmask ceil(remaining / steps_left) per
@@ -651,20 +671,20 @@ class NemotronDiffusionSampler(DiffusionSampler):
             force = max_steps.unsqueeze(-1) & (denoised_canvas == mask_id)
             denoised_canvas = torch.where(force, x0, denoised_canvas)
 
-        # EOS expansion (FastDiffuser-style): once an EOS appears in the
-        # block, fill every remaining masked position with EOS so the
-        # block terminates cleanly. Without this the model keeps emitting
-        # plausible-looking continuation tokens after EOS, which inflates
-        # generation length and degrades accuracy on benchmarks that read
-        # the boxed final answer.
+        # EOS fill: any positions still masked and inside the EOS-freeze
+        # range (computed pre-step) get filled with EOS now. Also catches
+        # the case where this step itself committed an EOS — for those,
+        # propagate forward to the rest of the block.
         if self.eos_token_id is not None:
             eos = self.eos_token_id
-            has_eos = (denoised_canvas == eos).any(dim=-1)  # [num_decode]
+            has_eos = (denoised_canvas == eos).any(dim=-1)
             if has_eos.any():
-                # First EOS position per row; positions before it stay,
-                # positions at-or-after that are still masked → EOS.
                 eos_pos = (denoised_canvas == eos).int()
-                first_eos = torch.argmax(eos_pos, dim=-1)  # [num_decode]
+                first_eos = torch.where(
+                    has_eos,
+                    torch.argmax(eos_pos, dim=-1),
+                    torch.full_like(eos_pos[:, 0], CL),
+                )
                 positions = torch.arange(CL, device=device).unsqueeze(0)
                 after_eos = positions >= first_eos.unsqueeze(-1)
                 fill_with_eos = (
@@ -677,7 +697,6 @@ class NemotronDiffusionSampler(DiffusionSampler):
                     torch.full_like(denoised_canvas, eos),
                     denoised_canvas,
                 )
-                # Re-check convergence after EOS fill.
                 no_masks_after = (denoised_canvas == mask_id).sum(dim=-1) == 0
                 converged = converged | no_masks_after
 
