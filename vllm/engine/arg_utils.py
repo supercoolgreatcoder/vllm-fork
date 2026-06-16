@@ -1721,8 +1721,16 @@ class EngineArgs:
         if hf_cfg is None:
             return None
         # ar_mode=true reuses the diffusion checkpoint as a plain causal AR
-        # LM; do not enable the diffusion runtime in that case.
+        # LM; do not enable the diffusion runtime in that case. Also clear
+        # ``canvas_length`` so ``ModelConfig.is_diffusion`` returns False
+        # and the standard V1 model runner picks up the model.
         if getattr(hf_cfg, "ar_mode", False):
+            if hasattr(hf_cfg, "canvas_length"):
+                delattr(hf_cfg, "canvas_length")
+            # ``is_diffusion`` is a ``@cached_property`` on ModelConfig;
+            # bust the cache so the runner sees the cleared value.
+            if "is_diffusion" in model_config.__dict__:
+                del model_config.__dict__["is_diffusion"]
             return None
         canvas_length = getattr(hf_cfg, "block_size", None)
         if canvas_length is None:

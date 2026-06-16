@@ -52,5 +52,11 @@ class NemotronLabsDiffusionConfig(PretrainedConfig):
         # ``canvas_length`` is the canonical field used by vLLM's diffusion
         # runtime (see ModelConfig.is_diffusion); Nemotron's HF config calls
         # it ``block_size``. Mirror the value so vLLM auto-detects this as a
-        # diffusion model and routes through the V2 model runner.
-        self.canvas_length = block_size
+        # diffusion model and routes through the V2 model runner — except in
+        # ar_mode, where we want the standard causal AR path (no diffusion
+        # state machine, no draft_tokens buffer). ar_mode may arrive via
+        # --hf-overrides AFTER the parent ``__init__`` populates attributes,
+        # so check both ``self`` and the original kwargs.
+        ar_mode = kwargs.get("ar_mode") or getattr(self, "ar_mode", False)
+        if not ar_mode:
+            self.canvas_length = block_size

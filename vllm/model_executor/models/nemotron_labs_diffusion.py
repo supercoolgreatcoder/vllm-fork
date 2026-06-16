@@ -360,8 +360,15 @@ class NemotronLabsDiffusionForBlockDiffusion(nn.Module, SupportsQuant, SupportsP
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    @staticmethod
-    def get_model_state_cls():
+    def get_model_state_cls(self):
+        # ar_mode=true bypasses the diffusion state machine: the model is
+        # served as a plain causal LM through vLLM's DefaultModelState.
+        if getattr(self.config, "ar_mode", False):
+            from vllm.v1.worker.gpu.model_states.default import (
+                DefaultModelState,
+            )
+
+            return DefaultModelState
         return NemotronLabsDiffusionModelState
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
