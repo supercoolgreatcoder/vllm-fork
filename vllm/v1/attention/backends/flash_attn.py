@@ -867,6 +867,17 @@ class FlashAttentionImpl(AttentionImpl):
                     dynamic_causal = causal
                     causal = False
 
+                # vllm-bundled flash_attn_varlen_func (wheel 0.23.0) is
+                # missing ``dynamic_causal``, ``mask_mod``, ``aux_tensors``
+                # kwargs even when fa_version=4. Pass them only when they
+                # carry a non-default value.
+                _extra_fa4 = {}
+                if dynamic_causal is not None:
+                    _extra_fa4["dynamic_causal"] = dynamic_causal
+                if mm_mask_mod is not None:
+                    _extra_fa4["mask_mod"] = mm_mask_mod
+                if mm_aux is not None:
+                    _extra_fa4["aux_tensors"] = mm_aux
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
@@ -887,11 +898,9 @@ class FlashAttentionImpl(AttentionImpl):
                     q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
-                    dynamic_causal=dynamic_causal,
                     num_splits=attn_metadata.max_num_splits,
                     s_aux=self.sinks,
-                    mask_mod=mm_mask_mod,
-                    aux_tensors=mm_aux,
+                    **_extra_fa4,
                 )
                 return output
 
