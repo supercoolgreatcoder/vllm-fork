@@ -806,7 +806,12 @@ class DiffusionGemmaModelState(ModelState):
             max_denoising_steps=max_denoising_steps,
             device=device,
             hidden_size=text_config.hidden_size,
-            stability_threshold=self.gen_config["stability_threshold"],
+            # Nemotron Labs Diffusion's generation_config omits this key.
+            # Fall back to 3 — the compiled sample_step requires ST≥1 to
+            # index ``history[:, 0]``; 3 matches the Gemma reference and
+            # adds minimal extra compute since the gate is only checked
+            # when ``confident`` is set.
+            stability_threshold=int(self.gen_config.get("stability_threshold", 3) or 3),
         )
         self._req_id_to_index: dict[str, int] = {}
 
@@ -915,12 +920,21 @@ class DiffusionGemmaModelState(ModelState):
         # positions. sc_embeds already holds probs @ embed_weight from the prior
         # denoise step, masked to zero by the sampler for slots not denoising
         # this step; only the MLP runs here. CPU metadata -> no GPU syncs.
+        #
+        # Skip the MLP entirely when the model does not provide one. Diffusion
+        # LMs without a self-conditioning head (e.g. Nemotron Labs Diffusion)
+        # set ``self.model.self_conditioning = None``; the sampler still writes
+        # the soft-embed buffer because it costs the same matmul either way,
+        # but nothing here reads it.
+        sc_mlp = getattr(self.model, "self_conditioning", None)
+        if sc_mlp is None:
+            return
         for slot, idx in zip(decode_slots_np.tolist(), decode_idx_np.tolist()):
             start = int(query_start_loc_np[idx])
             end = int(query_start_loc_np[idx + 1])
             canvas = slice(start, end)
             soft = sc_embeds[slot, : end - start]
-            inputs_embeds[canvas] = self.model.self_conditioning(
+            inputs_embeds[canvas] = sc_mlp(
                 inputs_embeds[canvas], soft.to(inputs_embeds.dtype)
             )
 

@@ -1,0 +1,1232 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Nemotron Labs Diffusion model for vLLM.
+
+Onboards ``nvidia/Nemotron-Labs-Diffusion-8B`` (and the public 3B
+TinyStories sibling) on top of the block-diffusion runtime introduced in
+#45163. The transformer body is Ministral-3-based (Llama-style GQA, YARN
+RoPE, RMSNorm, SwiGLU MLP) with one Nemotron-specific addition — the
+Llama-4 per-token Q scaling applied post-RoPE. ``ar_mode=true`` on the
+HF config switches attention from bidirectional (block-diffusion default)
+to fully causal so a plain AR decoder path matches the SGLang reference.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from itertools import islice
+from typing import Any
+
+import torch
+from torch import nn
+
+from vllm.config import VllmConfig
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
+from vllm.logger import init_logger
+from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from vllm.model_executor.models.diffusion_gemma import (
+    DiffusionGemmaModelState,
+    DiffusionSampler,
+)
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
+from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backend import AttentionType
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+import numpy as np
+
+from .interfaces import SupportsPP, SupportsQuant
+from .utils import (
+    PPMissingLayer,
+    WeightsMapper,
+    is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
+    make_layers,
+    maybe_prefix,
+)
+
+logger = init_logger(__name__)
+
+
+# Module-level flag toggled by ``NemotronLinearSpecSampler`` between
+# DRAFT (True) and VERIFY (False) iterations. Read by
+# ``NemotronLabsDiffusionAttention.forward`` to gate the LoRA delta
+# applied to the o_proj output. Module-level (not config) so it can
+# be flipped without crossing the engine→model boundary.
+_USE_LORA_DRAFT: bool = False
+
+
+def _set_lora_draft(use: bool) -> None:
+    global _USE_LORA_DRAFT
+    _USE_LORA_DRAFT = use
+
+
+def _load_lora_o_proj_deltas(
+    lora_path: str,
+    num_layers: int,
+    hidden_size: int,
+    alpha: float,
+    rank: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[int, torch.Tensor]:
+    """Load PEFT LoRA adapter for o_proj and precompute per-layer delta
+    matrices = (lora_B @ lora_A) * (alpha / rank).
+
+    Returns a dict mapping layer_idx -> [hidden, hidden] delta tensor.
+    """
+    import safetensors.torch as _st
+    import os as _os
+
+    adapter_file = _os.path.join(lora_path, "adapter_model.safetensors")
+    deltas: dict[int, torch.Tensor] = {}
+    scaling = float(alpha) / float(rank)
+    with _st.safe_open(adapter_file, framework="pt") as f:
+        for i in range(num_layers):
+            ka = (
+                f"base_model.model.encoder.layers.{i}.self_attn.o_proj"
+                ".lora_A.weight"
+            )
+            kb = (
+                f"base_model.model.encoder.layers.{i}.self_attn.o_proj"
+                ".lora_B.weight"
+            )
+            if ka not in f.keys() or kb not in f.keys():
+                continue
+            la = f.get_tensor(ka).to(torch.float32)
+            lb = f.get_tensor(kb).to(torch.float32)
+            delta = (lb @ la) * scaling  # [hidden, hidden]
+            deltas[i] = delta.to(device=device, dtype=dtype)
+    return deltas
+
+
+def _llama4_q_scale(
+    positions: torch.Tensor, beta: float, max_pos: int
+) -> torch.Tensor:
+    """Per-token Q scale = 1 + beta * log(1 + floor(pos / max_pos))."""
+    return (
+        1.0 + beta * torch.log(1.0 + torch.floor(positions.float() / max_pos))
+    ).unsqueeze(-1)
+
+
+class NemotronLabsDiffusionMLP(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            input_size=intermediate_size,
+            output_size=hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+        )
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+
+class NemotronLabsDiffusionAttention(nn.Module):
+    """Llama-style GQA attention + Llama-4 per-position Q scaling.
+
+    ``causal=True`` (the ``ar_mode`` toggle on the HF config) selects a
+    standard causal Attention block; otherwise an EncoderOnlyAttention
+    runs the bidirectional block-diffusion encoder pass.
+
+    LoRA-on-draft: when ``lora_o_proj_delta`` is set and the global
+    ``_USE_LORA_DRAFT`` flag is True (set by the LinearSpec sampler
+    before DRAFT iterations), the layer adds ``attn_input @ delta`` to
+    the o_proj output. Matches SGLang LinearSpec's ``lora_mode="draft_only"``
+    pattern from ``linear_spec_lora`` shipped with the model.
+    """
+
+    def __init__(
+        self,
+        config: Any,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        causal: bool = False,
+    ) -> None:
+        super().__init__()
+        # Set by NemotronLabsDiffusionTransformer at startup when
+        # `--dllm-lora-path` is provided and the LinearSpec sampler is
+        # active. Persists in fp16/bf16 on-device.
+        self.lora_o_proj_delta: torch.Tensor | None = None
+        tp_size = get_tensor_model_parallel_world_size()
+        self.hidden_size = config.hidden_size
+        self.total_num_heads = config.num_attention_heads
+        self.total_num_kv_heads = config.num_key_value_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        if self.total_num_kv_heads >= tp_size:
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.head_dim = getattr(config, "head_dim", None) or (
+            config.hidden_size // config.num_attention_heads
+        )
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+
+        rope_params = getattr(config, "rope_parameters", None) or {}
+        self.llama4_beta: float | None = rope_params.get("llama_4_scaling_beta")
+        self.max_pos = int(
+            rope_params.get(
+                "original_max_position_embeddings",
+                getattr(config, "max_position_embeddings", 16384),
+            )
+        )
+
+        attention_bias = getattr(config, "attention_bias", False)
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=config.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=self.total_num_heads,
+            total_num_kv_heads=self.total_num_kv_heads,
+            bias=attention_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
+        )
+        self.o_proj = RowParallelLinear(
+            input_size=self.total_num_heads * self.head_dim,
+            output_size=config.hidden_size,
+            bias=attention_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+
+        # vLLM's ``YaRNScalingRotaryEmbedding`` computes
+        # ``mscale = 0.1*log(factor) + 1.0`` and multiplies cos/sin by it
+        # by default — that gives 1.277 for Nemotron's factor=16 and
+        # silently rescales every rotary position. Nemotron's config
+        # explicitly sets ``mscale: 1.0`` (no extra scaling), so we
+        # override vLLM's auto-mscale by injecting
+        # ``apply_yarn_scaling=False`` into the rope dict; with
+        # attn_factor=1.0 (default) that makes mscale=1.0 and matches
+        # the model's training. Without this fix, the model's logits
+        # are sharply flatter — top-1 token probability drops ~10× and
+        # GSM8K accuracy drops ~5pp.
+        rope_params_for_vllm = {**rope_params} if rope_params else None
+        if rope_params_for_vllm and rope_params_for_vllm.get("rope_type") == "yarn":
+            if "apply_yarn_scaling" not in rope_params_for_vllm:
+                rope_params_for_vllm["apply_yarn_scaling"] = False
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            max_position=getattr(config, "max_position_embeddings", 16384),
+            rope_parameters=rope_params_for_vllm,
+            is_neox_style=True,
+        )
+
+        # Always use the unified Attention layer. The diffusion runtime
+        # (DiffusionGemmaModelState.prepare_attn) sets a per-request
+        # ``causal`` flag at runtime so the same KV-writing attention block
+        # serves both the causal (encoder/AR) and bidirectional (denoise)
+        # phases — exactly what the Gemma4 backbone does. For pure-AR mode
+        # (ar_mode=True with diffusion_config disabled), the kv_cache_update
+        # path also expects every attention layer to participate in KV write.
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            quant_config=quant_config,
+            attn_type=AttentionType.DECODER,
+            prefix=f"{prefix}.attn",
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
+
+        if self.llama4_beta is not None:
+            scale = _llama4_q_scale(positions, self.llama4_beta, self.max_pos).to(
+                q.dtype
+            )
+            q = q.view(-1, self.num_heads, self.head_dim)
+            q = (q * scale.unsqueeze(1)).view(-1, self.num_heads * self.head_dim)
+
+        attn_output = self.attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+
+        # LoRA-on-draft: apply the o_proj delta only on DRAFT iterations
+        # of LinearSpec. ``attn_output`` is the input to o_proj, and
+        # ``self.lora_o_proj_delta`` is the precomputed [hidden, hidden]
+        # delta matrix. Skips entirely when the delta tensor is unset
+        # (no LoRA configured) or when the global flag is False (any
+        # AR/FastDiffuser/Verify iteration).
+        if self.lora_o_proj_delta is not None and _USE_LORA_DRAFT:
+            output = output + attn_output @ self.lora_o_proj_delta.T
+
+        return output
+
+
+class NemotronLabsDiffusionDecoderLayer(nn.Module):
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        causal = bool(getattr(config, "ar_mode", False))
+
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = NemotronLabsDiffusionAttention(
+            config,
+            quant_config,
+            prefix=f"{prefix}.self_attn",
+            causal=causal,
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.mlp = NemotronLabsDiffusionMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(
+            positions=positions, hidden_states=hidden_states
+        )
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual
+        )
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
+
+
+class NemotronLabsDiffusionTransformer(nn.Module):
+    """Ministral-3 transformer body with optional ar_mode causal switch."""
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        self.config = config
+
+        if get_pp_group().is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda prefix: NemotronLabsDiffusionDecoderLayer(
+                vllm_config=vllm_config, prefix=prefix
+            ),
+            prefix=f"{prefix}.layers",
+        )
+
+        if get_pp_group().is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
+
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], config.hidden_size
+        )
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **_: Any,
+    ) -> torch.Tensor | IntermediateTensors:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            hidden_states, residual = layer(positions, hidden_states, residual)
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
+
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
+
+
+class NemotronLabsDiffusionForBlockDiffusion(nn.Module, SupportsQuant, SupportsPP):
+    """Nemotron Labs Diffusion served via the vLLM block-diffusion runtime.
+
+    Backbone: ``NemotronLabsDiffusionTransformer`` (Ministral-3 with the
+    Llama-4 Q scaling). Head: ``diffusion_head`` linear over the encoder's
+    last hidden state. The HF checkpoint stores the transformer under
+    ``encoder.*`` alongside a top-level ``diffusion_head.weight``.
+    """
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={"encoder.": "model."},
+    )
+
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+    def get_model_state_cls(self):
+        # ar_mode=true bypasses the diffusion state machine: the model is
+        # served as a plain causal LM through vLLM's DefaultModelState.
+        if getattr(self.config, "ar_mode", False):
+            from vllm.v1.worker.gpu.model_states.default import (
+                DefaultModelState,
+            )
+
+            return DefaultModelState
+        return NemotronLabsDiffusionModelState
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        self.config = config
+        self.model_dtype = vllm_config.model_config.dtype
+
+        self.model = NemotronLabsDiffusionTransformer(
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "model"),
+        )
+
+        self.diffusion_head = ParallelLMHead(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
+        )
+
+        self.logits_processor = LogitsProcessor(config.vocab_size, soft_cap=None)
+
+        # Nemotron has no self-conditioning MLP. The shared diffusion
+        # ModelState (see diffusion_gemma._apply_self_conditioning) skips
+        # the SC mixing step when this attribute is None.
+        self.self_conditioning = None
+
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
+
+        # LoRA-on-draft: if the config carries ``dllm_lora_path``, load
+        # the PEFT adapter targeting ``o_proj`` and install per-layer
+        # delta tensors so the LinearSpec sampler can flip them on for
+        # DRAFT iterations and off for VERIFY. Lazy-loaded after the
+        # base weights are in place — done at the end of load_weights().
+        self._lora_loaded = False
+
+    def _maybe_load_lora_on_draft(self) -> None:
+        if self._lora_loaded:
+            return
+        lora_path = getattr(self.config, "dllm_lora_path", None)
+        if not lora_path:
+            return
+        import os as _os, json as _json
+        cfg_path = _os.path.join(lora_path, "adapter_config.json")
+        try:
+            with open(cfg_path) as f:
+                ac = _json.load(f)
+        except FileNotFoundError:
+            logger.warning("LoRA adapter not found at %s", cfg_path)
+            return
+        if "o_proj" not in (ac.get("target_modules") or []):
+            logger.warning(
+                "LoRA adapter at %s does not target o_proj; skipping",
+                lora_path,
+            )
+            return
+        alpha = float(ac.get("lora_alpha", 1.0))
+        rank = int(ac.get("r", 1))
+        num_layers = int(self.config.num_hidden_layers)
+        hidden = int(self.config.hidden_size)
+        device = next(self.parameters()).device
+        deltas = _load_lora_o_proj_deltas(
+            lora_path, num_layers, hidden, alpha, rank, device, self.model_dtype
+        )
+        for i, layer in enumerate(self.model.layers):
+            if i in deltas and hasattr(layer, "self_attn"):
+                layer.self_attn.lora_o_proj_delta = deltas[i]
+        logger.info(
+            "LoRA-on-draft: loaded %d o_proj deltas (r=%d, alpha=%.0f, "
+            "scaling=%.2f) from %s",
+            len(deltas),
+            rank,
+            alpha,
+            alpha / max(rank, 1),
+            lora_path,
+        )
+        self._lora_loaded = True
+
+    def embed_input_ids(
+        self, input_ids: torch.Tensor, **_: Any
+    ) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | IntermediateTensors:
+        if intermediate_tensors is not None:
+            inputs_embeds = None
+        return self.model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            **kwargs,
+        )
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return self.logits_processor(self.diffusion_head, hidden_states)
+
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        """Apply HF→vLLM name remap and Llama-style stacked-param loading.
+
+        Stacks separate ``q/k/v_proj`` weights into ``qkv_proj`` and
+        ``gate/up_proj`` into ``gate_up_proj``, then loads the rest by name.
+        Matches the loader used by ``LlamaForCausalLM``.
+        """
+        stacked_params_mapping = [
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
+        mapped = self.hf_to_vllm_mapper.apply(weights)
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+        for name, loaded_weight in mapped:
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if "scale" in name or "zero_point" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                stacked_name = name.replace(weight_name, param_name)
+                if stacked_name.endswith(".bias") and stacked_name not in params_dict:
+                    continue
+                if is_pp_missing_parameter(stacked_name, self):
+                    continue
+                param = params_dict[stacked_name]
+                param.weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(stacked_name)
+                break
+            else:
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if is_pp_missing_parameter(name, self):
+                    continue
+                if name not in params_dict:
+                    logger.warning("Skipping unknown weight: %s", name)
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
+                )
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+        # LoRA-on-draft hookup (no-op if dllm_lora_path is unset).
+        self._maybe_load_lora_on_draft()
+        return loaded_params
+
+
+class NemotronDiffusionSampler(DiffusionSampler):
+    """FastDiffuser-style top-k confidence unmasking for Nemotron.
+
+    Mirrors SGLang's ``FastDiffuser`` decoder for Nemotron Labs Diffusion:
+
+    - Canvas is initialized to the model's ``mask_token_id`` (100), not
+      random tokens. The model was trained to predict the original token
+      at masked positions; passing random tokens (the Gemma path) is
+      off-distribution and produces gibberish.
+    - Each denoise step computes ``argmax(logits with mask suppressed)``
+      and the softmax probability of that argmax. The top-k positions by
+      probability are committed — k scales as ``ceil(remaining / steps_left)``
+      so the block converges in roughly ``max_denoising_steps`` rounds.
+    - No entropy bound, stability gate, or self-conditioning — none apply
+      to Nemotron's discrete-token diffusion paradigm.
+
+    Encoder/commit cycle is unchanged: when all positions are unmasked the
+    sampler flips ``is_encoder_phase`` so the next pass runs causally and
+    rewrites the KV cache for the freshly committed block (the
+    ``causal_context: true`` mode in SGLang's FastDiffuser yaml).
+    """
+
+    def __init__(
+        self,
+        sampler: Any,
+        diffusion_config: Any,
+        vocab_size: int,
+        diffusion_states: Any,
+        *,
+        mask_token_id: int,
+        eos_token_id: int | None,
+        max_denoising_steps: int,
+        embed_weight: torch.Tensor,
+        normalizer: torch.Tensor,
+    ) -> None:
+        super().__init__(
+            sampler=sampler,
+            diffusion_config=diffusion_config,
+            vocab_size=vocab_size,
+            diffusion_states=diffusion_states,
+            confidence_threshold=0.0,
+            t_min=0.0,
+            t_max=1.0,
+            entropy_bound=0.0,
+            embed_weight=embed_weight,
+            normalizer=normalizer,
+        )
+        self.mask_token_id = mask_token_id
+        self.eos_token_id = eos_token_id
+        self.max_denoising_steps_n = max_denoising_steps
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        input_batch: Any,
+        draft_logits: torch.Tensor | None = None,
+    ) -> SamplerOutput:
+        num_reqs = input_batch.num_reqs
+        device = logits.device
+
+        if input_batch.num_draft_tokens == 0:
+            # Block-1 seeding (matching HF's prefill-last-token seed) was
+            # tried here but regressed accuracy by ~2.5pp on GSM8K — the
+            # bidirectional first denoise step at all-masks already commits
+            # the highest-confidence position first, which approximates the
+            # same effect at lower cost. Only block-2+ benefits from
+            # explicit seeding (done in the commit branch below).
+            return self._handle_prefill(input_batch, device)
+
+        states = self.diffusion_states
+        CL = self.canvas_length
+        mask_id = self.mask_token_id
+
+        slots_np = input_batch.idx_mapping_np[:num_reqs]
+        per_req_nlogits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
+
+        decode_indices_np = np.where(per_req_nlogits_np > 0)[0]
+        prefill_indices_np = np.where(per_req_nlogits_np == 0)[0]
+        decode_slots_np = slots_np[decode_indices_np]
+
+        if len(prefill_indices_np) > 0:
+            self._finish_prefills(input_batch, prefill_indices_np)
+
+        num_decode = len(decode_indices_np)
+        self._decode_slots.np[:num_decode] = decode_slots_np
+        self._decode_idx.np[:num_decode] = decode_indices_np
+        self._decode_slots.copy_to_uva()
+        self._decode_idx.copy_to_uva()
+        decode_slots = self._decode_slots.gpu[:num_decode]
+        decode_idx = self._decode_idx.gpu[:num_decode]
+
+        sampled = self._sampled[:num_reqs]
+        num_sampled = self._num_sampled[:num_reqs]
+        sampled.zero_()
+        num_sampled.zero_()
+
+        if num_decode == 0:
+            return self._build_output(
+                input_batch, sampled, num_sampled, per_req_nlogits_np, device
+            )
+
+        # is_commit snapshot BEFORE we mutate state. Slots whose previous
+        # step converged have is_encoder_phase=True now — this pass ran
+        # them causally to refresh the KV cache, so we EMIT their existing
+        # canvas (no further denoising) and reset for the next block.
+        is_commit = states.is_encoder_phase[decode_slots].clone()
+        is_denoise = ~is_commit
+
+        valid_canvas_len_np = per_req_nlogits_np[per_req_nlogits_np > 0]
+        valid_canvas_len = torch.from_numpy(
+            valid_canvas_len_np.astype(np.int64)
+        ).to(device)
+
+        # Reshape logits to [num_decode, CL, vocab]. Truncated canvases
+        # (CL spans crossing max_model_len) have fewer than CL rows in
+        # logits — pad them here so the per-slot tensor view is uniform.
+        if valid_canvas_len_np.min() < CL:
+            ar = torch.arange(CL, device=device)
+            starts = valid_canvas_len.cumsum(0) - valid_canvas_len
+            valid = ar.unsqueeze(0) < valid_canvas_len.unsqueeze(1)
+            src = (starts.unsqueeze(1) + ar.unsqueeze(0)).clamp_max(
+                logits.shape[0] - 1
+            )
+            logits = logits[src.reshape(-1)] * valid.reshape(-1, 1).to(
+                logits.dtype
+            )
+
+        logits_2d = logits.view(num_decode, CL, -1)
+
+        # ---- EMIT FIRST: read the existing canvas for committing slots.
+        # This MUST happen before we mutate states.canvas below.
+        sampled[decode_idx] = (
+            states.canvas[decode_slots].to(sampled.dtype)
+            * is_commit.unsqueeze(-1).to(sampled.dtype)
+        )
+        num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * valid_canvas_len.to(
+            num_sampled.dtype
+        )
+
+        # ---- Update canvas for denoising slots via top-k unmasking.
+        # Match SGLang FastDiffuser's _compute_confidence exactly:
+        #   1. argmax with mask_id suppressed (-inf), so mask never wins,
+        #   2. softmax over the ORIGINAL logits in the model's dtype (no
+        #      float32 cast — SGLang gets 94.5% with bf16 throughout).
+        logits_for_argmax = logits_2d.clone()
+        logits_for_argmax[..., mask_id] = float("-inf")
+        x0 = torch.argmax(logits_for_argmax, dim=-1)  # [num_decode, CL]
+
+        probs = torch.softmax(logits_2d, dim=-1)
+        x0_p = probs.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
+
+        canvas = states.canvas[decode_slots].clone()  # [num_decode, CL]
+        is_masked = canvas == mask_id
+
+        # EOS-freeze (FastDiffuser): if EOS has already been committed in
+        # the block, every position at-or-after the first EOS is "frozen"
+        # — they get -inf confidence so the top-k never picks them, and
+        # they're filled with EOS at the end of this step. Without this
+        # the model keeps generating after an EOS landed mid-block,
+        # producing the long meandering outputs that drag down accuracy.
+        committed = ~is_masked
+        eos_freeze = torch.zeros_like(canvas, dtype=torch.bool)
+        if self.eos_token_id is not None:
+            eos = self.eos_token_id
+            eos_committed = committed & (canvas == eos)
+            if eos_committed.any():
+                first_eos_pos = torch.where(
+                    eos_committed.any(dim=-1),
+                    torch.argmax(eos_committed.int(), dim=-1),
+                    torch.full_like(eos_committed.int()[:, 0], CL),
+                )
+                positions = torch.arange(CL, device=device).unsqueeze(0)
+                eos_freeze = positions >= first_eos_pos.unsqueeze(-1)
+
+        # Confidence is only valid for masked AND non-frozen positions.
+        active = is_masked & ~eos_freeze
+        confidence = torch.where(
+            active, x0_p, torch.full_like(x0_p, float("-inf"))
+        )
+
+        # FastDiffuser scheduler: unmask ceil(remaining / steps_left) per
+        # step → converges in at most ``max_denoising_steps`` rounds.
+        step = states.step[decode_slots]
+        steps_left = (self.max_denoising_steps_n - step).clamp(min=1)
+        remaining_masks = is_masked.sum(dim=-1)
+        k = ((remaining_masks + steps_left - 1) // steps_left).clamp(min=1)
+        k = torch.minimum(k, remaining_masks)  # [num_decode]
+
+        # Top-k by confidence per slot. Positions whose rank < k AND are
+        # currently masked get committed.
+        ranks = torch.argsort(
+            torch.argsort(confidence, dim=-1, descending=True), dim=-1
+        )
+        unmask_mask = (ranks < k.unsqueeze(-1)) & is_masked
+        denoised_canvas = torch.where(unmask_mask, x0, canvas)
+
+        # Convergence: no remaining masks, or we've hit the step budget.
+        new_step = step + 1
+        max_steps = new_step >= self.max_denoising_steps_n
+        no_masks = (denoised_canvas == mask_id).sum(dim=-1) == 0
+        converged = no_masks | max_steps
+
+        # Force any leftover masks to argmax when we hit the step budget.
+        if max_steps.any():
+            force = max_steps.unsqueeze(-1) & (denoised_canvas == mask_id)
+            denoised_canvas = torch.where(force, x0, denoised_canvas)
+
+        # EOS fill: any positions still masked and inside the EOS-freeze
+        # range (computed pre-step) get filled with EOS now. Also catches
+        # the case where this step itself committed an EOS — for those,
+        # propagate forward to the rest of the block.
+        if self.eos_token_id is not None:
+            eos = self.eos_token_id
+            has_eos = (denoised_canvas == eos).any(dim=-1)
+            if has_eos.any():
+                eos_pos = (denoised_canvas == eos).int()
+                first_eos = torch.where(
+                    has_eos,
+                    torch.argmax(eos_pos, dim=-1),
+                    torch.full_like(eos_pos[:, 0], CL),
+                )
+                positions = torch.arange(CL, device=device).unsqueeze(0)
+                after_eos = positions >= first_eos.unsqueeze(-1)
+                fill_with_eos = (
+                    has_eos.unsqueeze(-1)
+                    & after_eos
+                    & (denoised_canvas == mask_id)
+                )
+                denoised_canvas = torch.where(
+                    fill_with_eos,
+                    torch.full_like(denoised_canvas, eos),
+                    denoised_canvas,
+                )
+                no_masks_after = (denoised_canvas == mask_id).sum(dim=-1) == 0
+                converged = converged | no_masks_after
+
+        # Slot-state writes:
+        #   committing slots → canvas reset to mask_id (start of next block)
+        #   denoising slots  → canvas updated to denoised_canvas
+        #
+        # Next-block seeding (writing ``argmax(causal-mode last-position
+        # logit)`` into the next block's pos 0 — matching HF
+        # ``output.logits[:, -1, :].argmax()`` between blocks) was tried
+        # here but did NOT improve full GSM8K (84.7% vs 86.4% without it).
+        # Keeping the simpler all-mask reset.
+        fresh_canvas = torch.full_like(canvas, mask_id)
+        new_canvas = torch.where(
+            is_commit.unsqueeze(-1), fresh_canvas, denoised_canvas
+        )
+        states.canvas[decode_slots] = new_canvas
+
+        # State machine: commit → denoise (encoder_phase=False, step=0).
+        # Denoise → commit when converged (encoder_phase=True). Step
+        # counter resets on commit; increments on denoise.
+        next_encoder = torch.where(
+            is_commit, torch.zeros_like(is_commit), converged & is_denoise
+        )
+        states.is_encoder_phase[decode_slots] = next_encoder
+        states.step[decode_slots] = torch.where(
+            is_commit, torch.zeros_like(new_step), new_step
+        )
+
+        # Draft tokens for next iteration's input_ids: the canvas
+        # (post-update) for all decode slots.
+        all_slots = input_batch.idx_mapping[:num_reqs]
+        self.req_states.draft_tokens[all_slots, :CL] = states.canvas[all_slots]
+
+        return self._build_output(
+            input_batch, sampled, num_sampled, per_req_nlogits_np, device
+        )
+
+
+class NemotronLinearSpecSampler(NemotronDiffusionSampler):
+    """LinearSpec draft+verify decoding for Nemotron Labs Diffusion.
+
+    Mirrors SGLang's ``LinearSpec`` algorithm: each block runs exactly two
+    forward passes through the model — a bidirectional ``draft`` pass that
+    fills the masked canvas in a single shot, and a causal ``verify`` pass
+    that re-scores the drafted tokens. Tokens are accepted up to the first
+    mismatch between the draft argmax (at position i+1) and the causal
+    argmax (at position i), then the trailing causal argmax becomes the
+    seed for the next block. Average acceptance length ~6-10 tokens/block
+    on GSM8K — the headline throughput config in SGLang's benchmarks.
+
+    State machine vs the FastDiffuser sampler:
+        is_encoder_phase=False (DRAFT)  -> bidirectional forward, store
+                                           argmax in pending_draft, write
+                                           canvas with drafts (so the next
+                                           causal forward sees them),
+                                           flip encoder_phase=True.
+        is_encoder_phase=True  (VERIFY) -> causal forward gave logits
+                                           over the drafted canvas; accept
+                                           matching prefix, emit accepted
+                                           tokens, sample the next-block
+                                           seed at canvas[0], reset the
+                                           rest to mask_id, flip
+                                           encoder_phase=False.
+
+    With block_size=32 and avg_accept=6.4, one accepted token costs
+    2/6.4 ≈ 0.31 forward passes — roughly 3.2× the throughput of pure AR
+    on the same hardware.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        device = self.diffusion_states.device
+        max_num_reqs = self.diffusion_states.max_num_reqs
+        # pending_draft[slot] caches the bidirectional argmax from the
+        # most recent DRAFT step so the VERIFY step can compare against
+        # it. Persists across vLLM iterations like the canvas.
+        self.pending_draft = torch.zeros(
+            max_num_reqs, self.canvas_length, dtype=torch.int64, device=device
+        )
+        # Per-slot seed for the NEXT block's position 0 (the causal
+        # argmax at the boundary). Computed at VERIFY time.
+        self.pending_seed = torch.zeros(
+            max_num_reqs, dtype=torch.int64, device=device
+        )
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        input_batch: Any,
+        draft_logits: torch.Tensor | None = None,
+    ) -> SamplerOutput:
+        num_reqs = input_batch.num_reqs
+        device = logits.device
+
+        if input_batch.num_draft_tokens == 0:
+            return self._handle_prefill(input_batch, device)
+
+        states = self.diffusion_states
+        CL = self.canvas_length
+        mask_id = self.mask_token_id
+
+        slots_np = input_batch.idx_mapping_np[:num_reqs]
+        per_req_nlogits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
+        decode_indices_np = np.where(per_req_nlogits_np > 0)[0]
+        prefill_indices_np = np.where(per_req_nlogits_np == 0)[0]
+        decode_slots_np = slots_np[decode_indices_np]
+
+        if len(prefill_indices_np) > 0:
+            self._finish_prefills(input_batch, prefill_indices_np)
+
+        num_decode = len(decode_indices_np)
+        self._decode_slots.np[:num_decode] = decode_slots_np
+        self._decode_idx.np[:num_decode] = decode_indices_np
+        self._decode_slots.copy_to_uva()
+        self._decode_idx.copy_to_uva()
+        decode_slots = self._decode_slots.gpu[:num_decode]
+        decode_idx = self._decode_idx.gpu[:num_decode]
+
+        sampled = self._sampled[:num_reqs]
+        num_sampled = self._num_sampled[:num_reqs]
+        sampled.zero_()
+        num_sampled.zero_()
+
+        if num_decode == 0:
+            return self._build_output(
+                input_batch, sampled, num_sampled, per_req_nlogits_np, device
+            )
+
+        is_verify = states.is_encoder_phase[decode_slots].clone()
+        is_draft = ~is_verify
+
+        # LoRA-on-draft: the NEXT iteration's flag depends on what we
+        # set ``is_encoder_phase`` to at the end of this call. After
+        # this sampler returns:
+        #   - draft slots (is_draft=True) flip to is_encoder_phase=True
+        #     => NEXT step is VERIFY => disable LoRA
+        #   - verify slots flip to is_encoder_phase=False => NEXT step
+        #     is DRAFT => enable LoRA
+        # Mixed batches choose VERIFY (no LoRA) to stay safe; with
+        # max_num_seqs uniform this matches all slots in practice.
+        next_is_draft = bool(is_verify.any().item()) and not bool(
+            is_draft.any().item()
+        )
+        _set_lora_draft(next_is_draft)
+
+        valid_canvas_len_np = per_req_nlogits_np[per_req_nlogits_np > 0]
+        valid_canvas_len = torch.from_numpy(
+            valid_canvas_len_np.astype(np.int64)
+        ).to(device)
+
+        # Pad truncated canvases.
+        if valid_canvas_len_np.min() < CL:
+            ar = torch.arange(CL, device=device)
+            starts = valid_canvas_len.cumsum(0) - valid_canvas_len
+            valid = ar.unsqueeze(0) < valid_canvas_len.unsqueeze(1)
+            src = (starts.unsqueeze(1) + ar.unsqueeze(0)).clamp_max(
+                logits.shape[0] - 1
+            )
+            logits = logits[src.reshape(-1)] * valid.reshape(-1, 1).to(
+                logits.dtype
+            )
+
+        logits_2d = logits.view(num_decode, CL, -1)
+
+        # argmax(logits with mask suppressed) per canvas position
+        logits_for_argmax = logits_2d.clone()
+        logits_for_argmax[..., mask_id] = float("-inf")
+        argmax = torch.argmax(logits_for_argmax, dim=-1)  # [num_decode, CL]
+
+        canvas = states.canvas[decode_slots].clone()  # [num_decode, CL]
+
+        # ===== DRAFT step =====
+        # For draft slots: argmax IS the drafts. Save into pending_draft,
+        # write into canvas (the next iteration's causal verify will
+        # see the drafted tokens as input). The seed at position 0 (if
+        # any) is preserved — it's already in the canvas.
+        if is_draft.any():
+            seed_present = canvas[:, 0] != mask_id  # [num_decode]
+            drafts = argmax.clone()
+            # Keep the seed at position 0 if one was placed there.
+            drafts = torch.where(
+                seed_present.unsqueeze(-1) & (
+                    torch.arange(CL, device=device).unsqueeze(0) == 0
+                ),
+                canvas,
+                drafts,
+            )
+            # Apply only to draft slots:
+            new_canvas_draft = torch.where(
+                is_draft.unsqueeze(-1), drafts, canvas
+            )
+            # Save pending_draft for the upcoming verify step.
+            self.pending_draft[decode_slots] = torch.where(
+                is_draft.unsqueeze(-1),
+                drafts,
+                self.pending_draft[decode_slots],
+            )
+        else:
+            new_canvas_draft = canvas
+
+        # ===== VERIFY step =====
+        # For verify slots: the causal forward returned argmax. Compare
+        # to pending_draft: AR's prediction at position i should match
+        # draft at position i+1. Accept the matching prefix. Emit
+        # [seed + AR's predictions on accepted positions]. Build the
+        # next block: canvas = [next_seed, mask, mask, ..., mask].
+        emit_canvas = torch.full_like(canvas, mask_id)  # holds emit slots only
+        emit_len = torch.zeros(num_decode, dtype=torch.int64, device=device)
+        next_block_canvas = torch.full_like(canvas, mask_id)
+
+        if is_verify.any():
+            drafts_for_verify = self.pending_draft[decode_slots]  # [num_decode, CL]
+            # seed at position 0 of drafts (was kept across draft step)
+            # AR's argmax at position i predicts what comes after.
+            # Compare draft[1..CL-1] vs AR[0..CL-2].
+            # matches[i] = draft[i+1] == AR[i].
+            matches = drafts_for_verify[:, 1:] == argmax[:, :-1]  # [nd, CL-1]
+            # Longest matching prefix length c (per slot).
+            cumprod = matches.int().cumprod(dim=-1)
+            c = cumprod.sum(dim=-1)  # [num_decode], in [0, CL-1]
+
+            # Output sequence per slot: [seed_token, AR[0], AR[1], ..., AR[c-1]]
+            # Total emitted length = c + 1.
+            seed_tok = drafts_for_verify[:, 0]
+            # AR predictions at positions [0..c-1] are accepted.
+            # Build emit by writing seed at 0, AR[0..c-1] at positions
+            # [1..c]. We'll truncate at emit_len when reading.
+            emit_len = (c + 1)  # [num_decode]
+            # Apply EOS truncation if eos_token_id present
+            if self.eos_token_id is not None:
+                eos = self.eos_token_id
+                # Build a tentative emit canvas:
+                tentative = torch.zeros_like(canvas)
+                tentative[:, 0] = seed_tok
+                tentative[:, 1:] = argmax[:, :-1]  # AR[0..CL-2] aligned to pos 1..CL-1
+                # Mask out positions beyond accepted length (treat as if absent).
+                positions = torch.arange(CL, device=device).unsqueeze(0)
+                in_accepted = positions < emit_len.unsqueeze(-1)
+                eos_in_accepted = in_accepted & (tentative == eos)
+                # If EOS in accepted range, truncate emit_len to first EOS+1.
+                has_eos = eos_in_accepted.any(dim=-1)
+                if has_eos.any():
+                    first_eos = torch.where(
+                        has_eos,
+                        torch.argmax(eos_in_accepted.int(), dim=-1),
+                        torch.full_like(emit_len, CL),
+                    )
+                    new_emit_len = torch.where(
+                        has_eos, first_eos + 1, emit_len
+                    )
+                    emit_len = new_emit_len
+                emit_canvas = tentative
+            else:
+                emit_canvas = torch.zeros_like(canvas)
+                emit_canvas[:, 0] = seed_tok
+                emit_canvas[:, 1:] = argmax[:, :-1]
+
+            # Next-block seed: AR's argmax at the FIRST non-accepted
+            # position. If c == CL-1 (all matched), use AR at CL-1.
+            seed_pos = c.clamp(max=CL - 1)
+            next_seed = argmax.gather(1, seed_pos.unsqueeze(-1)).squeeze(-1)
+            next_block_canvas[:, 0] = next_seed
+
+        # ---- EMIT FIRST: read emit_canvas for verify slots ----
+        # Use emit_canvas truncated by emit_len; positions beyond emit_len
+        # stay 0 (no emit). vLLM scheduler trims at EOS itself, but we
+        # also mask post-emit_len positions to zero just in case.
+        positions_grid = torch.arange(CL, device=device).unsqueeze(0)
+        emit_mask = positions_grid < emit_len.unsqueeze(-1)
+        masked_emit = torch.where(
+            emit_mask, emit_canvas, torch.zeros_like(emit_canvas)
+        )
+        sampled[decode_idx] = (
+            masked_emit.to(sampled.dtype)
+            * is_verify.unsqueeze(-1).to(sampled.dtype)
+        )
+        num_sampled[decode_idx] = (
+            is_verify.to(num_sampled.dtype) * emit_len.to(num_sampled.dtype)
+        )
+
+        # ---- Update canvas: draft slots get drafts, verify slots get
+        # the next-block canvas (seed + masks). ----
+        new_canvas = torch.where(
+            is_verify.unsqueeze(-1), next_block_canvas, new_canvas_draft
+        )
+        states.canvas[decode_slots] = new_canvas
+
+        # State machine: draft -> verify (encoder_phase=True next).
+        #                verify -> draft (encoder_phase=False next).
+        next_encoder = torch.where(
+            is_verify, torch.zeros_like(is_verify), torch.ones_like(is_verify)
+        )
+        states.is_encoder_phase[decode_slots] = next_encoder
+        # step counter unused in LinearSpec but parent infra may read it.
+        states.step[decode_slots] = 0
+
+        # Draft tokens for next iteration's input_ids.
+        all_slots = input_batch.idx_mapping[:num_reqs]
+        self.req_states.draft_tokens[all_slots, :CL] = states.canvas[all_slots]
+
+        return self._build_output(
+            input_batch, sampled, num_sampled, per_req_nlogits_np, device
+        )
+
+
+class NemotronLabsDiffusionModelState(DiffusionGemmaModelState):
+    """ModelState for Nemotron Labs Diffusion.
+
+    Subclasses the shared DiffusionGemmaModelState. The Nemotron checkpoint
+    lacks a self-conditioning MLP and an embedding normalizer; the parent
+    class skips the SC mixing step when ``self.model.self_conditioning is
+    None`` (see diffusion_gemma._apply_self_conditioning).
+
+    Canvas init is overridden to use Nemotron's ``mask_token_id`` (the
+    Gemma default of random tokens is off-distribution here — the model
+    was trained to denoise from a uniform mask).
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Override canvas init: Nemotron expects MASK tokens, not random.
+        mask_token_id = getattr(
+            self.model_config.hf_config, "mask_token_id", 100
+        )
+        ds = self.diffusion_states
+        ds.canvas.fill_(mask_token_id)
+        ds.argmax_canvas.fill_(mask_token_id)
+        # Monkey-patch init_canvas so newly-prefilled requests also start
+        # from all-masks. ``DiffusionGemmaRequestStates.init_canvas`` would
+        # otherwise overwrite with ``torch.randint``.
+        self._mask_token_id = mask_token_id
+        _orig_states = ds
+
+        def _init_canvas(slot_indices_np):
+            _orig_states.canvas[slot_indices_np] = mask_token_id
+            _orig_states.argmax_canvas[slot_indices_np] = mask_token_id
+
+        ds.init_canvas = _init_canvas
+
+    def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
+        diffusion_config = self.vllm_config.diffusion_config
+        gen = self.gen_config or {}
+        max_denoising_steps = (
+            diffusion_config.max_denoising_steps
+            if diffusion_config and diffusion_config.max_denoising_steps
+            else int(gen.get("max_denoising_steps", 32))
+        )
+        eos_token_id = getattr(self.model_config.hf_config, "eos_token_id", None)
+
+        # Algorithm selection via HF override (e.g.
+        # --hf-overrides '{"dllm_algorithm": "LinearSpec"}'). Defaults
+        # to FastDiffuser to preserve the GSM8K 93.3% accuracy headline.
+        algorithm = getattr(
+            self.model_config.hf_config, "dllm_algorithm", "FastDiffuser"
+        )
+        sampler_kwargs = dict(
+            sampler=sampler,
+            diffusion_config=diffusion_config,
+            vocab_size=self.model_config.get_vocab_size(),
+            diffusion_states=self.diffusion_states,
+            mask_token_id=self._mask_token_id,
+            eos_token_id=int(eos_token_id) if eos_token_id is not None else None,
+            max_denoising_steps=max_denoising_steps,
+            embed_weight=self.model.model.embed_tokens.weight,
+            normalizer=torch.tensor(1.0, device=self.device),
+        )
+
+        if algorithm == "LinearSpec":
+            cls = NemotronLinearSpecSampler
+        elif algorithm in ("FastDiffuser", None, ""):
+            cls = NemotronDiffusionSampler
+        else:
+            logger.warning(
+                "Unknown dllm_algorithm=%r; falling back to FastDiffuser",
+                algorithm,
+            )
+            cls = NemotronDiffusionSampler
+
+        return cls(**sampler_kwargs), None
