@@ -114,6 +114,11 @@ class NemotronLabsDiffusionForBlockDiffusion(nn.Module, SupportsQuant, SupportsP
             self.model.make_empty_intermediate_tensors
         )
 
+    def embed_input_ids(
+        self, input_ids: torch.Tensor, **kwargs: Any
+    ) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids, **kwargs)
+
     def forward(
         self,
         input_ids: torch.Tensor,
