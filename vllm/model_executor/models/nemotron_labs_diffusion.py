@@ -68,6 +68,58 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+# Module-level flag toggled by ``NemotronLinearSpecSampler`` between
+# DRAFT (True) and VERIFY (False) iterations. Read by
+# ``NemotronLabsDiffusionAttention.forward`` to gate the LoRA delta
+# applied to the o_proj output. Module-level (not config) so it can
+# be flipped without crossing the engine→model boundary.
+_USE_LORA_DRAFT: bool = False
+
+
+def _set_lora_draft(use: bool) -> None:
+    global _USE_LORA_DRAFT
+    _USE_LORA_DRAFT = use
+
+
+def _load_lora_o_proj_deltas(
+    lora_path: str,
+    num_layers: int,
+    hidden_size: int,
+    alpha: float,
+    rank: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[int, torch.Tensor]:
+    """Load PEFT LoRA adapter for o_proj and precompute per-layer delta
+    matrices = (lora_B @ lora_A) * (alpha / rank).
+
+    Returns a dict mapping layer_idx -> [hidden, hidden] delta tensor.
+    """
+    import safetensors.torch as _st
+    import os as _os
+
+    adapter_file = _os.path.join(lora_path, "adapter_model.safetensors")
+    deltas: dict[int, torch.Tensor] = {}
+    scaling = float(alpha) / float(rank)
+    with _st.safe_open(adapter_file, framework="pt") as f:
+        for i in range(num_layers):
+            ka = (
+                f"base_model.model.encoder.layers.{i}.self_attn.o_proj"
+                ".lora_A.weight"
+            )
+            kb = (
+                f"base_model.model.encoder.layers.{i}.self_attn.o_proj"
+                ".lora_B.weight"
+            )
+            if ka not in f.keys() or kb not in f.keys():
+                continue
+            la = f.get_tensor(ka).to(torch.float32)
+            lb = f.get_tensor(kb).to(torch.float32)
+            delta = (lb @ la) * scaling  # [hidden, hidden]
+            deltas[i] = delta.to(device=device, dtype=dtype)
+    return deltas
+
+
 def _llama4_q_scale(
     positions: torch.Tensor, beta: float, max_pos: int
 ) -> torch.Tensor:
@@ -115,6 +167,12 @@ class NemotronLabsDiffusionAttention(nn.Module):
     ``causal=True`` (the ``ar_mode`` toggle on the HF config) selects a
     standard causal Attention block; otherwise an EncoderOnlyAttention
     runs the bidirectional block-diffusion encoder pass.
+
+    LoRA-on-draft: when ``lora_o_proj_delta`` is set and the global
+    ``_USE_LORA_DRAFT`` flag is True (set by the LinearSpec sampler
+    before DRAFT iterations), the layer adds ``attn_input @ delta`` to
+    the o_proj output. Matches SGLang LinearSpec's ``lora_mode="draft_only"``
+    pattern from ``linear_spec_lora`` shipped with the model.
     """
 
     def __init__(
@@ -125,6 +183,10 @@ class NemotronLabsDiffusionAttention(nn.Module):
         causal: bool = False,
     ) -> None:
         super().__init__()
+        # Set by NemotronLabsDiffusionTransformer at startup when
+        # `--dllm-lora-path` is provided and the LinearSpec sampler is
+        # active. Persists in fp16/bf16 on-device.
+        self.lora_o_proj_delta: torch.Tensor | None = None
         tp_size = get_tensor_model_parallel_world_size()
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
@@ -230,6 +292,16 @@ class NemotronLabsDiffusionAttention(nn.Module):
 
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
+
+        # LoRA-on-draft: apply the o_proj delta only on DRAFT iterations
+        # of LinearSpec. ``attn_output`` is the input to o_proj, and
+        # ``self.lora_o_proj_delta`` is the precomputed [hidden, hidden]
+        # delta matrix. Skips entirely when the delta tensor is unset
+        # (no LoRA configured) or when the global flag is False (any
+        # AR/FastDiffuser/Verify iteration).
+        if self.lora_o_proj_delta is not None and _USE_LORA_DRAFT:
+            output = output + attn_output @ self.lora_o_proj_delta.T
+
         return output
 
 
@@ -413,6 +485,55 @@ class NemotronLabsDiffusionForBlockDiffusion(nn.Module, SupportsQuant, SupportsP
             self.model.make_empty_intermediate_tensors
         )
 
+        # LoRA-on-draft: if the config carries ``dllm_lora_path``, load
+        # the PEFT adapter targeting ``o_proj`` and install per-layer
+        # delta tensors so the LinearSpec sampler can flip them on for
+        # DRAFT iterations and off for VERIFY. Lazy-loaded after the
+        # base weights are in place — done at the end of load_weights().
+        self._lora_loaded = False
+
+    def _maybe_load_lora_on_draft(self) -> None:
+        if self._lora_loaded:
+            return
+        lora_path = getattr(self.config, "dllm_lora_path", None)
+        if not lora_path:
+            return
+        import os as _os, json as _json
+        cfg_path = _os.path.join(lora_path, "adapter_config.json")
+        try:
+            with open(cfg_path) as f:
+                ac = _json.load(f)
+        except FileNotFoundError:
+            logger.warning("LoRA adapter not found at %s", cfg_path)
+            return
+        if "o_proj" not in (ac.get("target_modules") or []):
+            logger.warning(
+                "LoRA adapter at %s does not target o_proj; skipping",
+                lora_path,
+            )
+            return
+        alpha = float(ac.get("lora_alpha", 1.0))
+        rank = int(ac.get("r", 1))
+        num_layers = int(self.config.num_hidden_layers)
+        hidden = int(self.config.hidden_size)
+        device = next(self.parameters()).device
+        deltas = _load_lora_o_proj_deltas(
+            lora_path, num_layers, hidden, alpha, rank, device, self.model_dtype
+        )
+        for i, layer in enumerate(self.model.layers):
+            if i in deltas and hasattr(layer, "self_attn"):
+                layer.self_attn.lora_o_proj_delta = deltas[i]
+        logger.info(
+            "LoRA-on-draft: loaded %d o_proj deltas (r=%d, alpha=%.0f, "
+            "scaling=%.2f) from %s",
+            len(deltas),
+            rank,
+            alpha,
+            alpha / max(rank, 1),
+            lora_path,
+        )
+        self._lora_loaded = True
+
     def embed_input_ids(
         self, input_ids: torch.Tensor, **_: Any
     ) -> torch.Tensor:
@@ -491,6 +612,8 @@ class NemotronLabsDiffusionForBlockDiffusion(nn.Module, SupportsQuant, SupportsP
                 )
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
+        # LoRA-on-draft hookup (no-op if dllm_lora_path is unset).
+        self._maybe_load_lora_on_draft()
         return loaded_params
 
 
@@ -858,6 +981,20 @@ class NemotronLinearSpecSampler(NemotronDiffusionSampler):
 
         is_verify = states.is_encoder_phase[decode_slots].clone()
         is_draft = ~is_verify
+
+        # LoRA-on-draft: the NEXT iteration's flag depends on what we
+        # set ``is_encoder_phase`` to at the end of this call. After
+        # this sampler returns:
+        #   - draft slots (is_draft=True) flip to is_encoder_phase=True
+        #     => NEXT step is VERIFY => disable LoRA
+        #   - verify slots flip to is_encoder_phase=False => NEXT step
+        #     is DRAFT => enable LoRA
+        # Mixed batches choose VERIFY (no LoRA) to stay safe; with
+        # max_num_seqs uniform this matches all slots in practice.
+        next_is_draft = bool(is_verify.any().item()) and not bool(
+            is_draft.any().item()
+        )
+        _set_lora_draft(next_is_draft)
 
         valid_canvas_len_np = per_req_nlogits_np[per_req_nlogits_np > 0]
         valid_canvas_len = torch.from_numpy(
