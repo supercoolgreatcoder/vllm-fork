@@ -179,6 +179,10 @@ _TEXT_GENERATION_MODELS = {
     "MiMoV2FlashForCausalLM": ("mimo_v2", "MiMoV2FlashForCausalLM"),
     "MiMoV2ForCausalLM": ("mimo_v2", "MiMoV2ForCausalLM"),
     "NemotronForCausalLM": ("nemotron", "NemotronForCausalLM"),
+    "NemotronLabsDiffusionModel": (
+        "nemotron_labs_diffusion",
+        "NemotronLabsDiffusionForBlockDiffusion",
+    ),
     "NemotronHForCausalLM": ("nemotron_h", "NemotronHForCausalLM"),
     "NemotronHPuzzleForCausalLM": ("nemotron_h", "NemotronHForCausalLM"),
     "OlmoForCausalLM": ("olmo", "OlmoForCausalLM"),
@@ -405,10 +409,6 @@ _MULTIMODAL_MODELS = {
     "DiffusionGemmaForBlockDiffusion": (
         "diffusion_gemma",
         "DiffusionGemmaForConditionalGeneration",
-    ),
-    "NemotronLabsDiffusionModel": (
-        "nemotron_labs_diffusion",
-        "NemotronLabsDiffusionForBlockDiffusion",
     ),
     "Gemma4ForConditionalGeneration": ("gemma4_mm", "Gemma4ForConditionalGeneration"),
     "Gemma4UnifiedForConditionalGeneration": (

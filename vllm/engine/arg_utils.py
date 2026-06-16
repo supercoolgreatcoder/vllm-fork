@@ -1720,6 +1720,10 @@ class EngineArgs:
         hf_cfg = getattr(model_config, "hf_config", None)
         if hf_cfg is None:
             return None
+        # ar_mode=true reuses the diffusion checkpoint as a plain causal AR
+        # LM; do not enable the diffusion runtime in that case.
+        if getattr(hf_cfg, "ar_mode", False):
+            return None
         canvas_length = getattr(hf_cfg, "block_size", None)
         if canvas_length is None:
             return None
