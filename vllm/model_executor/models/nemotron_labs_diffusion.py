@@ -155,11 +155,12 @@ class NemotronLabsDiffusionForBlockDiffusion(nn.Module, SupportsQuant, SupportsP
         """
         from vllm.model_executor.models.llama import LlamaForCausalLM
 
-        # Delegate the encoder.* → model.* prefix mapping and qkv / gate_up
-        # stacking to LlamaForCausalLM.load_weights, which already understands
-        # ``packed_modules_mapping``. The diffusion_head weight tensor passes
-        # through unchanged.
-        return LlamaForCausalLM.load_weights(self, weights)
+        # Apply our `hf_to_vllm_mapper` (encoder. → model.) before delegating;
+        # `LlamaForCausalLM.load_weights` handles qkv / gate_up stacking via
+        # ``packed_modules_mapping``. The ``diffusion_head.weight`` tensor
+        # passes through unchanged.
+        mapped_weights = self.hf_to_vllm_mapper.apply(weights)
+        return LlamaForCausalLM.load_weights(self, mapped_weights)
 
 
 class NemotronLabsDiffusionModelState(DiffusionGemmaModelState):
