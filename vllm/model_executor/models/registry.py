@@ -406,6 +406,10 @@ _MULTIMODAL_MODELS = {
         "diffusion_gemma",
         "DiffusionGemmaForConditionalGeneration",
     ),
+    "NemotronLabsDiffusionModel": (
+        "nemotron_labs_diffusion",
+        "NemotronLabsDiffusionForBlockDiffusion",
+    ),
     "Gemma4ForConditionalGeneration": ("gemma4_mm", "Gemma4ForConditionalGeneration"),
     "Gemma4UnifiedForConditionalGeneration": (
         "gemma4_unified",
