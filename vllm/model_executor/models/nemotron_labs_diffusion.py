@@ -766,6 +766,259 @@ class NemotronDiffusionSampler(DiffusionSampler):
         )
 
 
+class NemotronLinearSpecSampler(NemotronDiffusionSampler):
+    """LinearSpec draft+verify decoding for Nemotron Labs Diffusion.
+
+    Mirrors SGLang's ``LinearSpec`` algorithm: each block runs exactly two
+    forward passes through the model — a bidirectional ``draft`` pass that
+    fills the masked canvas in a single shot, and a causal ``verify`` pass
+    that re-scores the drafted tokens. Tokens are accepted up to the first
+    mismatch between the draft argmax (at position i+1) and the causal
+    argmax (at position i), then the trailing causal argmax becomes the
+    seed for the next block. Average acceptance length ~6-10 tokens/block
+    on GSM8K — the headline throughput config in SGLang's benchmarks.
+
+    State machine vs the FastDiffuser sampler:
+        is_encoder_phase=False (DRAFT)  -> bidirectional forward, store
+                                           argmax in pending_draft, write
+                                           canvas with drafts (so the next
+                                           causal forward sees them),
+                                           flip encoder_phase=True.
+        is_encoder_phase=True  (VERIFY) -> causal forward gave logits
+                                           over the drafted canvas; accept
+                                           matching prefix, emit accepted
+                                           tokens, sample the next-block
+                                           seed at canvas[0], reset the
+                                           rest to mask_id, flip
+                                           encoder_phase=False.
+
+    With block_size=32 and avg_accept=6.4, one accepted token costs
+    2/6.4 ≈ 0.31 forward passes — roughly 3.2× the throughput of pure AR
+    on the same hardware.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        device = self.diffusion_states.device
+        max_num_reqs = self.diffusion_states.max_num_reqs
+        # pending_draft[slot] caches the bidirectional argmax from the
+        # most recent DRAFT step so the VERIFY step can compare against
+        # it. Persists across vLLM iterations like the canvas.
+        self.pending_draft = torch.zeros(
+            max_num_reqs, self.canvas_length, dtype=torch.int64, device=device
+        )
+        # Per-slot seed for the NEXT block's position 0 (the causal
+        # argmax at the boundary). Computed at VERIFY time.
+        self.pending_seed = torch.zeros(
+            max_num_reqs, dtype=torch.int64, device=device
+        )
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        input_batch: Any,
+        draft_logits: torch.Tensor | None = None,
+    ) -> SamplerOutput:
+        num_reqs = input_batch.num_reqs
+        device = logits.device
+
+        if input_batch.num_draft_tokens == 0:
+            return self._handle_prefill(input_batch, device)
+
+        states = self.diffusion_states
+        CL = self.canvas_length
+        mask_id = self.mask_token_id
+
+        slots_np = input_batch.idx_mapping_np[:num_reqs]
+        per_req_nlogits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
+        decode_indices_np = np.where(per_req_nlogits_np > 0)[0]
+        prefill_indices_np = np.where(per_req_nlogits_np == 0)[0]
+        decode_slots_np = slots_np[decode_indices_np]
+
+        if len(prefill_indices_np) > 0:
+            self._finish_prefills(input_batch, prefill_indices_np)
+
+        num_decode = len(decode_indices_np)
+        self._decode_slots.np[:num_decode] = decode_slots_np
+        self._decode_idx.np[:num_decode] = decode_indices_np
+        self._decode_slots.copy_to_uva()
+        self._decode_idx.copy_to_uva()
+        decode_slots = self._decode_slots.gpu[:num_decode]
+        decode_idx = self._decode_idx.gpu[:num_decode]
+
+        sampled = self._sampled[:num_reqs]
+        num_sampled = self._num_sampled[:num_reqs]
+        sampled.zero_()
+        num_sampled.zero_()
+
+        if num_decode == 0:
+            return self._build_output(
+                input_batch, sampled, num_sampled, per_req_nlogits_np, device
+            )
+
+        is_verify = states.is_encoder_phase[decode_slots].clone()
+        is_draft = ~is_verify
+
+        valid_canvas_len_np = per_req_nlogits_np[per_req_nlogits_np > 0]
+        valid_canvas_len = torch.from_numpy(
+            valid_canvas_len_np.astype(np.int64)
+        ).to(device)
+
+        # Pad truncated canvases.
+        if valid_canvas_len_np.min() < CL:
+            ar = torch.arange(CL, device=device)
+            starts = valid_canvas_len.cumsum(0) - valid_canvas_len
+            valid = ar.unsqueeze(0) < valid_canvas_len.unsqueeze(1)
+            src = (starts.unsqueeze(1) + ar.unsqueeze(0)).clamp_max(
+                logits.shape[0] - 1
+            )
+            logits = logits[src.reshape(-1)] * valid.reshape(-1, 1).to(
+                logits.dtype
+            )
+
+        logits_2d = logits.view(num_decode, CL, -1)
+
+        # argmax(logits with mask suppressed) per canvas position
+        logits_for_argmax = logits_2d.clone()
+        logits_for_argmax[..., mask_id] = float("-inf")
+        argmax = torch.argmax(logits_for_argmax, dim=-1)  # [num_decode, CL]
+
+        canvas = states.canvas[decode_slots].clone()  # [num_decode, CL]
+
+        # ===== DRAFT step =====
+        # For draft slots: argmax IS the drafts. Save into pending_draft,
+        # write into canvas (the next iteration's causal verify will
+        # see the drafted tokens as input). The seed at position 0 (if
+        # any) is preserved — it's already in the canvas.
+        if is_draft.any():
+            seed_present = canvas[:, 0] != mask_id  # [num_decode]
+            drafts = argmax.clone()
+            # Keep the seed at position 0 if one was placed there.
+            drafts = torch.where(
+                seed_present.unsqueeze(-1) & (
+                    torch.arange(CL, device=device).unsqueeze(0) == 0
+                ),
+                canvas,
+                drafts,
+            )
+            # Apply only to draft slots:
+            new_canvas_draft = torch.where(
+                is_draft.unsqueeze(-1), drafts, canvas
+            )
+            # Save pending_draft for the upcoming verify step.
+            self.pending_draft[decode_slots] = torch.where(
+                is_draft.unsqueeze(-1),
+                drafts,
+                self.pending_draft[decode_slots],
+            )
+        else:
+            new_canvas_draft = canvas
+
+        # ===== VERIFY step =====
+        # For verify slots: the causal forward returned argmax. Compare
+        # to pending_draft: AR's prediction at position i should match
+        # draft at position i+1. Accept the matching prefix. Emit
+        # [seed + AR's predictions on accepted positions]. Build the
+        # next block: canvas = [next_seed, mask, mask, ..., mask].
+        emit_canvas = torch.full_like(canvas, mask_id)  # holds emit slots only
+        emit_len = torch.zeros(num_decode, dtype=torch.int64, device=device)
+        next_block_canvas = torch.full_like(canvas, mask_id)
+
+        if is_verify.any():
+            drafts_for_verify = self.pending_draft[decode_slots]  # [num_decode, CL]
+            # seed at position 0 of drafts (was kept across draft step)
+            # AR's argmax at position i predicts what comes after.
+            # Compare draft[1..CL-1] vs AR[0..CL-2].
+            # matches[i] = draft[i+1] == AR[i].
+            matches = drafts_for_verify[:, 1:] == argmax[:, :-1]  # [nd, CL-1]
+            # Longest matching prefix length c (per slot).
+            cumprod = matches.int().cumprod(dim=-1)
+            c = cumprod.sum(dim=-1)  # [num_decode], in [0, CL-1]
+
+            # Output sequence per slot: [seed_token, AR[0], AR[1], ..., AR[c-1]]
+            # Total emitted length = c + 1.
+            seed_tok = drafts_for_verify[:, 0]
+            # AR predictions at positions [0..c-1] are accepted.
+            # Build emit by writing seed at 0, AR[0..c-1] at positions
+            # [1..c]. We'll truncate at emit_len when reading.
+            emit_len = (c + 1)  # [num_decode]
+            # Apply EOS truncation if eos_token_id present
+            if self.eos_token_id is not None:
+                eos = self.eos_token_id
+                # Build a tentative emit canvas:
+                tentative = torch.zeros_like(canvas)
+                tentative[:, 0] = seed_tok
+                tentative[:, 1:] = argmax[:, :-1]  # AR[0..CL-2] aligned to pos 1..CL-1
+                # Mask out positions beyond accepted length (treat as if absent).
+                positions = torch.arange(CL, device=device).unsqueeze(0)
+                in_accepted = positions < emit_len.unsqueeze(-1)
+                eos_in_accepted = in_accepted & (tentative == eos)
+                # If EOS in accepted range, truncate emit_len to first EOS+1.
+                has_eos = eos_in_accepted.any(dim=-1)
+                if has_eos.any():
+                    first_eos = torch.where(
+                        has_eos,
+                        torch.argmax(eos_in_accepted.int(), dim=-1),
+                        torch.full_like(emit_len, CL),
+                    )
+                    new_emit_len = torch.where(
+                        has_eos, first_eos + 1, emit_len
+                    )
+                    emit_len = new_emit_len
+                emit_canvas = tentative
+            else:
+                emit_canvas = torch.zeros_like(canvas)
+                emit_canvas[:, 0] = seed_tok
+                emit_canvas[:, 1:] = argmax[:, :-1]
+
+            # Next-block seed: AR's argmax at the FIRST non-accepted
+            # position. If c == CL-1 (all matched), use AR at CL-1.
+            seed_pos = c.clamp(max=CL - 1)
+            next_seed = argmax.gather(1, seed_pos.unsqueeze(-1)).squeeze(-1)
+            next_block_canvas[:, 0] = next_seed
+
+        # ---- EMIT FIRST: read emit_canvas for verify slots ----
+        # Use emit_canvas truncated by emit_len; positions beyond emit_len
+        # stay 0 (no emit). vLLM scheduler trims at EOS itself, but we
+        # also mask post-emit_len positions to zero just in case.
+        positions_grid = torch.arange(CL, device=device).unsqueeze(0)
+        emit_mask = positions_grid < emit_len.unsqueeze(-1)
+        masked_emit = torch.where(
+            emit_mask, emit_canvas, torch.zeros_like(emit_canvas)
+        )
+        sampled[decode_idx] = (
+            masked_emit.to(sampled.dtype)
+            * is_verify.unsqueeze(-1).to(sampled.dtype)
+        )
+        num_sampled[decode_idx] = (
+            is_verify.to(num_sampled.dtype) * emit_len.to(num_sampled.dtype)
+        )
+
+        # ---- Update canvas: draft slots get drafts, verify slots get
+        # the next-block canvas (seed + masks). ----
+        new_canvas = torch.where(
+            is_verify.unsqueeze(-1), next_block_canvas, new_canvas_draft
+        )
+        states.canvas[decode_slots] = new_canvas
+
+        # State machine: draft -> verify (encoder_phase=True next).
+        #                verify -> draft (encoder_phase=False next).
+        next_encoder = torch.where(
+            is_verify, torch.zeros_like(is_verify), torch.ones_like(is_verify)
+        )
+        states.is_encoder_phase[decode_slots] = next_encoder
+        # step counter unused in LinearSpec but parent infra may read it.
+        states.step[decode_slots] = 0
+
+        # Draft tokens for next iteration's input_ids.
+        all_slots = input_batch.idx_mapping[:num_reqs]
+        self.req_states.draft_tokens[all_slots, :CL] = states.canvas[all_slots]
+
+        return self._build_output(
+            input_batch, sampled, num_sampled, per_req_nlogits_np, device
+        )
+
+
 class NemotronLabsDiffusionModelState(DiffusionGemmaModelState):
     """ModelState for Nemotron Labs Diffusion.
 
@@ -809,7 +1062,14 @@ class NemotronLabsDiffusionModelState(DiffusionGemmaModelState):
             else int(gen.get("max_denoising_steps", 32))
         )
         eos_token_id = getattr(self.model_config.hf_config, "eos_token_id", None)
-        return NemotronDiffusionSampler(
+
+        # Algorithm selection via HF override (e.g.
+        # --hf-overrides '{"dllm_algorithm": "LinearSpec"}'). Defaults
+        # to FastDiffuser to preserve the GSM8K 93.3% accuracy headline.
+        algorithm = getattr(
+            self.model_config.hf_config, "dllm_algorithm", "FastDiffuser"
+        )
+        sampler_kwargs = dict(
             sampler=sampler,
             diffusion_config=diffusion_config,
             vocab_size=self.model_config.get_vocab_size(),
@@ -819,4 +1079,17 @@ class NemotronLabsDiffusionModelState(DiffusionGemmaModelState):
             max_denoising_steps=max_denoising_steps,
             embed_weight=self.model.model.embed_tokens.weight,
             normalizer=torch.tensor(1.0, device=self.device),
-        ), None
+        )
+
+        if algorithm == "LinearSpec":
+            cls = NemotronLinearSpecSampler
+        elif algorithm in ("FastDiffuser", None, ""):
+            cls = NemotronDiffusionSampler
+        else:
+            logger.warning(
+                "Unknown dllm_algorithm=%r; falling back to FastDiffuser",
+                algorithm,
+            )
+            cls = NemotronDiffusionSampler
+
+        return cls(**sampler_kwargs), None
