@@ -170,10 +170,25 @@ class NemotronLabsDiffusionAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
+        # vLLM's ``YaRNScalingRotaryEmbedding`` computes
+        # ``mscale = 0.1*log(factor) + 1.0`` and multiplies cos/sin by it
+        # by default — that gives 1.277 for Nemotron's factor=16 and
+        # silently rescales every rotary position. Nemotron's config
+        # explicitly sets ``mscale: 1.0`` (no extra scaling), so we
+        # override vLLM's auto-mscale by injecting
+        # ``apply_yarn_scaling=False`` into the rope dict; with
+        # attn_factor=1.0 (default) that makes mscale=1.0 and matches
+        # the model's training. Without this fix, the model's logits
+        # are sharply flatter — top-1 token probability drops ~10× and
+        # GSM8K accuracy drops ~5pp.
+        rope_params_for_vllm = {**rope_params} if rope_params else None
+        if rope_params_for_vllm and rope_params_for_vllm.get("rope_type") == "yarn":
+            if "apply_yarn_scaling" not in rope_params_for_vllm:
+                rope_params_for_vllm["apply_yarn_scaling"] = False
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=getattr(config, "max_position_embeddings", 16384),
-            rope_parameters=rope_params or None,
+            rope_parameters=rope_params_for_vllm,
             is_neox_style=True,
         )
 
