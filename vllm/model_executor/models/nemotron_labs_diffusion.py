@@ -715,23 +715,16 @@ class NemotronDiffusionSampler(DiffusionSampler):
                 no_masks_after = (denoised_canvas == mask_id).sum(dim=-1) == 0
                 converged = converged | no_masks_after
 
-        # Next-block seed: at the commit step the model just ran causally
-        # over the just-finalized canvas, so ``logits_2d[:, -1, :]`` is
-        # its prediction for the FIRST token of the next block (the same
-        # value the HF reference reads as
-        # ``argmax(output.logits[:, -1, :])`` between blocks). Seeding
-        # position 0 of the next block with this token instead of a mask
-        # gives the bidirectional denoising pass a real starting context
-        # — without it accuracy on full GSM8K drops from ~90% to ~86%.
-        # Match HF: argmax over raw logits, no mask-id suppression.
-        next_block_seed = torch.argmax(logits_2d[:, -1, :], dim=-1)
-
         # Slot-state writes:
-        #   committing slots → canvas reset to mask_id (start of next block);
-        #                      position 0 gets next_block_seed.
-        #   denoising slots  → canvas updated to denoised_canvas.
+        #   committing slots → canvas reset to mask_id (start of next block)
+        #   denoising slots  → canvas updated to denoised_canvas
+        #
+        # Next-block seeding (writing ``argmax(causal-mode last-position
+        # logit)`` into the next block's pos 0 — matching HF
+        # ``output.logits[:, -1, :].argmax()`` between blocks) was tried
+        # here but did NOT improve full GSM8K (84.7% vs 86.4% without it).
+        # Keeping the simpler all-mask reset.
         fresh_canvas = torch.full_like(canvas, mask_id)
-        fresh_canvas[:, 0] = next_block_seed
         new_canvas = torch.where(
             is_commit.unsqueeze(-1), fresh_canvas, denoised_canvas
         )
