@@ -1703,13 +1703,38 @@ class EngineArgs:
         )
         return SpeculativeConfig(**self.speculative_config)
 
-    def create_diffusion_config(self) -> DiffusionConfig | None:
-        if self.diffusion_config is None:
+    def create_diffusion_config(
+        self, model_config: "ModelConfig | None" = None
+    ) -> DiffusionConfig | None:
+        if self.diffusion_config is not None:
+            cfg = self.diffusion_config
+            if isinstance(cfg, str):
+                cfg = json.loads(cfg)
+            return DiffusionConfig(**cfg)
+
+        # Auto-resolve from the HF config for models that declare their own
+        # diffusion defaults (block_size, max_denoising_steps). Lets users
+        # serve a diffusion checkpoint without passing --diffusion-config.
+        if model_config is None:
             return None
-        cfg = self.diffusion_config
-        if isinstance(cfg, str):
-            cfg = json.loads(cfg)
-        return DiffusionConfig(**cfg)
+        hf_cfg = getattr(model_config, "hf_config", None)
+        if hf_cfg is None:
+            return None
+        canvas_length = getattr(hf_cfg, "block_size", None)
+        if canvas_length is None:
+            return None
+        max_steps = getattr(hf_cfg, "max_denoising_steps", None)
+        if max_steps is None:
+            try:
+                gen_cfg = model_config.try_get_generation_config()
+                if gen_cfg is not None:
+                    max_steps = gen_cfg.get("max_denoising_steps")
+            except Exception:
+                max_steps = None
+        return DiffusionConfig(
+            canvas_length=int(canvas_length),
+            max_denoising_steps=(int(max_steps) if max_steps else None),
+        )
 
     def create_engine_config(
         self,
@@ -2025,7 +2050,7 @@ class EngineArgs:
             target_model_config=model_config,
             target_parallel_config=parallel_config,
         )
-        diffusion_config = self.create_diffusion_config()
+        diffusion_config = self.create_diffusion_config(model_config)
 
         self._set_default_max_num_seqs_and_batched_tokens_args(
             usage_context,
