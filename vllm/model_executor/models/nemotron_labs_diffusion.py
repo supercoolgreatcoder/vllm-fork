@@ -51,6 +51,9 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+import numpy as np
 
 from .interfaces import SupportsPP, SupportsQuant
 from .utils import (
@@ -469,6 +472,245 @@ class NemotronLabsDiffusionForBlockDiffusion(nn.Module, SupportsQuant, SupportsP
         return loaded_params
 
 
+class NemotronDiffusionSampler(DiffusionSampler):
+    """FastDiffuser-style top-k confidence unmasking for Nemotron.
+
+    Mirrors SGLang's ``FastDiffuser`` decoder for Nemotron Labs Diffusion:
+
+    - Canvas is initialized to the model's ``mask_token_id`` (100), not
+      random tokens. The model was trained to predict the original token
+      at masked positions; passing random tokens (the Gemma path) is
+      off-distribution and produces gibberish.
+    - Each denoise step computes ``argmax(logits with mask suppressed)``
+      and the softmax probability of that argmax. The top-k positions by
+      probability are committed — k scales as ``ceil(remaining / steps_left)``
+      so the block converges in roughly ``max_denoising_steps`` rounds.
+    - No entropy bound, stability gate, or self-conditioning — none apply
+      to Nemotron's discrete-token diffusion paradigm.
+
+    Encoder/commit cycle is unchanged: when all positions are unmasked the
+    sampler flips ``is_encoder_phase`` so the next pass runs causally and
+    rewrites the KV cache for the freshly committed block (the
+    ``causal_context: true`` mode in SGLang's FastDiffuser yaml).
+    """
+
+    def __init__(
+        self,
+        sampler: Any,
+        diffusion_config: Any,
+        vocab_size: int,
+        diffusion_states: Any,
+        *,
+        mask_token_id: int,
+        eos_token_id: int | None,
+        max_denoising_steps: int,
+        embed_weight: torch.Tensor,
+        normalizer: torch.Tensor,
+    ) -> None:
+        super().__init__(
+            sampler=sampler,
+            diffusion_config=diffusion_config,
+            vocab_size=vocab_size,
+            diffusion_states=diffusion_states,
+            confidence_threshold=0.0,
+            t_min=0.0,
+            t_max=1.0,
+            entropy_bound=0.0,
+            embed_weight=embed_weight,
+            normalizer=normalizer,
+        )
+        self.mask_token_id = mask_token_id
+        self.eos_token_id = eos_token_id
+        self.max_denoising_steps_n = max_denoising_steps
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        input_batch: Any,
+        draft_logits: torch.Tensor | None = None,
+    ) -> SamplerOutput:
+        num_reqs = input_batch.num_reqs
+        device = logits.device
+
+        if input_batch.num_draft_tokens == 0:
+            return self._handle_prefill(input_batch, device)
+
+        states = self.diffusion_states
+        CL = self.canvas_length
+        mask_id = self.mask_token_id
+
+        slots_np = input_batch.idx_mapping_np[:num_reqs]
+        per_req_nlogits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
+
+        decode_indices_np = np.where(per_req_nlogits_np > 0)[0]
+        prefill_indices_np = np.where(per_req_nlogits_np == 0)[0]
+        decode_slots_np = slots_np[decode_indices_np]
+
+        if len(prefill_indices_np) > 0:
+            self._finish_prefills(input_batch, prefill_indices_np)
+
+        num_decode = len(decode_indices_np)
+        self._decode_slots.np[:num_decode] = decode_slots_np
+        self._decode_idx.np[:num_decode] = decode_indices_np
+        self._decode_slots.copy_to_uva()
+        self._decode_idx.copy_to_uva()
+        decode_slots = self._decode_slots.gpu[:num_decode]
+        decode_idx = self._decode_idx.gpu[:num_decode]
+
+        sampled = self._sampled[:num_reqs]
+        num_sampled = self._num_sampled[:num_reqs]
+        sampled.zero_()
+        num_sampled.zero_()
+
+        if num_decode == 0:
+            return self._build_output(
+                input_batch, sampled, num_sampled, per_req_nlogits_np, device
+            )
+
+        # is_commit snapshot BEFORE we mutate state. Slots whose previous
+        # step converged have is_encoder_phase=True now — this pass ran
+        # them causally to refresh the KV cache, so we EMIT their existing
+        # canvas (no further denoising) and reset for the next block.
+        is_commit = states.is_encoder_phase[decode_slots].clone()
+        is_denoise = ~is_commit
+
+        valid_canvas_len_np = per_req_nlogits_np[per_req_nlogits_np > 0]
+        valid_canvas_len = torch.from_numpy(
+            valid_canvas_len_np.astype(np.int64)
+        ).to(device)
+
+        # Reshape logits to [num_decode, CL, vocab]. Truncated canvases
+        # (CL spans crossing max_model_len) have fewer than CL rows in
+        # logits — pad them here so the per-slot tensor view is uniform.
+        if valid_canvas_len_np.min() < CL:
+            ar = torch.arange(CL, device=device)
+            starts = valid_canvas_len.cumsum(0) - valid_canvas_len
+            valid = ar.unsqueeze(0) < valid_canvas_len.unsqueeze(1)
+            src = (starts.unsqueeze(1) + ar.unsqueeze(0)).clamp_max(
+                logits.shape[0] - 1
+            )
+            logits = logits[src.reshape(-1)] * valid.reshape(-1, 1).to(
+                logits.dtype
+            )
+
+        logits_2d = logits.view(num_decode, CL, -1)
+
+        # ---- EMIT FIRST: read the existing canvas for committing slots.
+        # This MUST happen before we mutate states.canvas below.
+        sampled[decode_idx] = (
+            states.canvas[decode_slots].to(sampled.dtype)
+            * is_commit.unsqueeze(-1).to(sampled.dtype)
+        )
+        num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * valid_canvas_len.to(
+            num_sampled.dtype
+        )
+
+        # ---- Update canvas for denoising slots via top-k unmasking.
+        # Suppress mask_id in argmax (the model never wants to predict mask).
+        logits_for_argmax = logits_2d.clone()
+        logits_for_argmax[..., mask_id] = float("-inf")
+        x0 = torch.argmax(logits_for_argmax, dim=-1)  # [num_decode, CL]
+
+        # Softmax confidence of the argmax token (use original logits).
+        probs = torch.softmax(logits_2d.float(), dim=-1)
+        x0_p = probs.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
+
+        canvas = states.canvas[decode_slots].clone()  # [num_decode, CL]
+        is_masked = canvas == mask_id
+
+        # Confidence is only valid for masked positions; -inf elsewhere
+        # so they never win the top-k.
+        confidence = torch.where(
+            is_masked, x0_p, torch.full_like(x0_p, float("-inf"))
+        )
+
+        # FastDiffuser scheduler: unmask ceil(remaining / steps_left) per
+        # step → converges in at most ``max_denoising_steps`` rounds.
+        step = states.step[decode_slots]
+        steps_left = (self.max_denoising_steps_n - step).clamp(min=1)
+        remaining_masks = is_masked.sum(dim=-1)
+        k = ((remaining_masks + steps_left - 1) // steps_left).clamp(min=1)
+        k = torch.minimum(k, remaining_masks)  # [num_decode]
+
+        # Top-k by confidence per slot. Positions whose rank < k AND are
+        # currently masked get committed.
+        ranks = torch.argsort(
+            torch.argsort(confidence, dim=-1, descending=True), dim=-1
+        )
+        unmask_mask = (ranks < k.unsqueeze(-1)) & is_masked
+        denoised_canvas = torch.where(unmask_mask, x0, canvas)
+
+        # Convergence: no remaining masks, or we've hit the step budget.
+        new_step = step + 1
+        max_steps = new_step >= self.max_denoising_steps_n
+        no_masks = (denoised_canvas == mask_id).sum(dim=-1) == 0
+        converged = no_masks | max_steps
+
+        # Force any leftover masks to argmax when we hit the step budget.
+        if max_steps.any():
+            force = max_steps.unsqueeze(-1) & (denoised_canvas == mask_id)
+            denoised_canvas = torch.where(force, x0, denoised_canvas)
+
+        # EOS expansion (FastDiffuser-style): once an EOS appears in the
+        # block, fill every remaining masked position with EOS so the
+        # block terminates cleanly. Without this the model keeps emitting
+        # plausible-looking continuation tokens after EOS, which inflates
+        # generation length and degrades accuracy on benchmarks that read
+        # the boxed final answer.
+        if self.eos_token_id is not None:
+            eos = self.eos_token_id
+            has_eos = (denoised_canvas == eos).any(dim=-1)  # [num_decode]
+            if has_eos.any():
+                # First EOS position per row; positions before it stay,
+                # positions at-or-after that are still masked → EOS.
+                eos_pos = (denoised_canvas == eos).int()
+                first_eos = torch.argmax(eos_pos, dim=-1)  # [num_decode]
+                positions = torch.arange(CL, device=device).unsqueeze(0)
+                after_eos = positions >= first_eos.unsqueeze(-1)
+                fill_with_eos = (
+                    has_eos.unsqueeze(-1)
+                    & after_eos
+                    & (denoised_canvas == mask_id)
+                )
+                denoised_canvas = torch.where(
+                    fill_with_eos,
+                    torch.full_like(denoised_canvas, eos),
+                    denoised_canvas,
+                )
+                # Re-check convergence after EOS fill.
+                no_masks_after = (denoised_canvas == mask_id).sum(dim=-1) == 0
+                converged = converged | no_masks_after
+
+        # Slot-state writes:
+        #   committing slots → canvas reset to mask_id (start of next block)
+        #   denoising slots  → canvas updated to denoised_canvas
+        fresh_canvas = torch.full_like(canvas, mask_id)
+        new_canvas = torch.where(
+            is_commit.unsqueeze(-1), fresh_canvas, denoised_canvas
+        )
+        states.canvas[decode_slots] = new_canvas
+
+        # State machine: commit → denoise (encoder_phase=False, step=0).
+        # Denoise → commit when converged (encoder_phase=True). Step
+        # counter resets on commit; increments on denoise.
+        next_encoder = torch.where(
+            is_commit, torch.zeros_like(is_commit), converged & is_denoise
+        )
+        states.is_encoder_phase[decode_slots] = next_encoder
+        states.step[decode_slots] = torch.where(
+            is_commit, torch.zeros_like(new_step), new_step
+        )
+
+        # Draft tokens for next iteration's input_ids: the canvas
+        # (post-update) for all decode slots.
+        all_slots = input_batch.idx_mapping[:num_reqs]
+        self.req_states.draft_tokens[all_slots, :CL] = states.canvas[all_slots]
+
+        return self._build_output(
+            input_batch, sampled, num_sampled, per_req_nlogits_np, device
+        )
+
+
 class NemotronLabsDiffusionModelState(DiffusionGemmaModelState):
     """ModelState for Nemotron Labs Diffusion.
 
@@ -476,22 +718,50 @@ class NemotronLabsDiffusionModelState(DiffusionGemmaModelState):
     lacks a self-conditioning MLP and an embedding normalizer; the parent
     class skips the SC mixing step when ``self.model.self_conditioning is
     None`` (see diffusion_gemma._apply_self_conditioning).
+
+    Canvas init is overridden to use Nemotron's ``mask_token_id`` (the
+    Gemma default of random tokens is off-distribution here — the model
+    was trained to denoise from a uniform mask).
     """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Override canvas init: Nemotron expects MASK tokens, not random.
+        mask_token_id = getattr(
+            self.model_config.hf_config, "mask_token_id", 100
+        )
+        ds = self.diffusion_states
+        ds.canvas.fill_(mask_token_id)
+        ds.argmax_canvas.fill_(mask_token_id)
+        # Monkey-patch init_canvas so newly-prefilled requests also start
+        # from all-masks. ``DiffusionGemmaRequestStates.init_canvas`` would
+        # otherwise overwrite with ``torch.randint``.
+        self._mask_token_id = mask_token_id
+        _orig_states = ds
+
+        def _init_canvas(slot_indices_np):
+            _orig_states.canvas[slot_indices_np] = mask_token_id
+            _orig_states.argmax_canvas[slot_indices_np] = mask_token_id
+
+        ds.init_canvas = _init_canvas
 
     def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
         diffusion_config = self.vllm_config.diffusion_config
         gen = self.gen_config or {}
-        sampler_cfg = gen.get("sampler_config") or {}
-        entropy_bound = float(sampler_cfg.get("entropy_bound", 0.0) or 0.0)
-        return DiffusionSampler(
+        max_denoising_steps = (
+            diffusion_config.max_denoising_steps
+            if diffusion_config and diffusion_config.max_denoising_steps
+            else int(gen.get("max_denoising_steps", 32))
+        )
+        eos_token_id = getattr(self.model_config.hf_config, "eos_token_id", None)
+        return NemotronDiffusionSampler(
             sampler=sampler,
             diffusion_config=diffusion_config,
             vocab_size=self.model_config.get_vocab_size(),
             diffusion_states=self.diffusion_states,
-            t_min=float(gen.get("t_min", 0.0)),
-            t_max=float(gen.get("t_max", 1.0)),
-            entropy_bound=entropy_bound,
-            confidence_threshold=float(gen.get("confidence_threshold", 0.0)),
+            mask_token_id=self._mask_token_id,
+            eos_token_id=int(eos_token_id) if eos_token_id is not None else None,
+            max_denoising_steps=max_denoising_steps,
             embed_weight=self.model.model.embed_tokens.weight,
             normalizer=torch.tensor(1.0, device=self.device),
         ), None
