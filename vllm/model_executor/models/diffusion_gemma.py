@@ -806,7 +806,12 @@ class DiffusionGemmaModelState(ModelState):
             max_denoising_steps=max_denoising_steps,
             device=device,
             hidden_size=text_config.hidden_size,
-            stability_threshold=self.gen_config["stability_threshold"],
+            # Nemotron Labs Diffusion's generation_config omits this key.
+            # Fall back to 3 — the compiled sample_step requires ST≥1 to
+            # index ``history[:, 0]``; 3 matches the Gemma reference and
+            # adds minimal extra compute since the gate is only checked
+            # when ``confident`` is set.
+            stability_threshold=int(self.gen_config.get("stability_threshold", 3) or 3),
         )
         self._req_id_to_index: dict[str, int] = {}
 

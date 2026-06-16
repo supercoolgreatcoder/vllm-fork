@@ -49,3 +49,8 @@ class NemotronLabsDiffusionConfig(PretrainedConfig):
 
         self.block_size = block_size
         self.mask_id = mask_id
+        # ``canvas_length`` is the canonical field used by vLLM's diffusion
+        # runtime (see ModelConfig.is_diffusion); Nemotron's HF config calls
+        # it ``block_size``. Mirror the value so vLLM auto-detects this as a
+        # diffusion model and routes through the V2 model runner.
+        self.canvas_length = block_size

@@ -27,10 +27,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.attention import (
-    Attention,
-    EncoderOnlyAttention,
-)
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -177,15 +174,20 @@ class NemotronLabsDiffusionAttention(nn.Module):
             is_neox_style=True,
         )
 
-        attn_type = AttentionType.DECODER if causal else AttentionType.ENCODER_ONLY
-        attn_cls = Attention if causal else EncoderOnlyAttention
-        self.attn = attn_cls(
+        # Always use the unified Attention layer. The diffusion runtime
+        # (DiffusionGemmaModelState.prepare_attn) sets a per-request
+        # ``causal`` flag at runtime so the same KV-writing attention block
+        # serves both the causal (encoder/AR) and bidirectional (denoise)
+        # phases — exactly what the Gemma4 backbone does. For pure-AR mode
+        # (ar_mode=True with diffusion_config disabled), the kv_cache_update
+        # path also expects every attention layer to participate in KV write.
+        self.attn = Attention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             quant_config=quant_config,
-            attn_type=attn_type,
+            attn_type=AttentionType.DECODER,
             prefix=f"{prefix}.attn",
         )
 
